@@ -33,3 +33,8 @@ build/
 
 ### VS Code ###
 .vscode/
+
+.data/
+grafana-data/
+prometheus-data/
+postgres-data/
