@@ -6,14 +6,26 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "branch": "main",
-  "accounts": "acc-12,acc-20",
+  "branch": "hw-02",
+  "accounts": "acc-5",
   "ratePerSecond": 2,
-  "testCount": 10,
-  "processingTimeMillis": 80000,
+  "testCount": 100,
+  "processingTimeMillis": 60000,
   "onPremises": true
 }
 
 ### Stop running test to save credits
 # @timeout 120
 POST http://77.234.215.138:31234/test/stop/{{serviceName}}
+
+# case-1
+#{
+#  "serviceName": "{{serviceName}}",
+#  "token": "{{token}}",
+#  "branch": "hw-01",
+#  "accounts": "acc-3",
+#  "ratePerSecond": 11,
+#  "testCount": 1200,
+#  "processingTimeMillis": 80000,
+#  "onPremises": true
+#}
