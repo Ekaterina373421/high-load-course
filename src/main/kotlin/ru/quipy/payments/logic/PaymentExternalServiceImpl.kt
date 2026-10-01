@@ -36,6 +36,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val expectedProcessingMillis = requestAverageProcessingTime.toMillis()
 
     // кейс 1. создаем rate limiter с лимитом из настроек аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -46,6 +47,13 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val deadlineAt = resolveDeadline(paymentStartedAt, deadline)
+
+        if (!canBeProcessedBefore(deadlineAt)) {
+            rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
+            return
+        }
+
         // кейс 1. блокируем поток, пока не освободится слот
         rateLimiter.tickBlocking()
 
@@ -56,6 +64,11 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
 
         try {
+            if (!canBeProcessedBefore(deadlineAt)) {
+                rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
+                return
+            }
+
             logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
@@ -109,6 +122,26 @@ class PaymentExternalSystemAdapterImpl(
             if (slotReleased.compareAndSet(false, true)) {
                 window.release()
             }
+        }
+    }
+    private fun canBeProcessedBefore(deadlineAt: Long) = now() + expectedProcessingMillis <= deadlineAt
+
+    private fun resolveDeadline(paymentStartedAt: Long, deadline: Long): Long =
+        if (deadline > 0L) paymentStartedAt + deadline else Long.MAX_VALUE   // дедлайн не задан
+
+    // Оплату, которая не успеет до дедлайна, обрабатываем локально: провайдера не беспокоим, но исход фиксируем
+    // в event store, чтобы сервис тестирования увидел завершённый жизненный цикл оплаты
+    private fun rejectBeforeSubmission(paymentId: UUID, paymentStartedAt: Long, deadline: Long, deadlineAt: Long) {
+        val transactionId = UUID.randomUUID()
+        logger.warn(
+            "[$accountName] Payment $paymentId rejected locally: deadline exceeded " +
+                "(deadline=$deadline, deadlineAt=$deadlineAt, now=${now()}, expectedProcessingMillis=$expectedProcessingMillis)"
+        )
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before submission.")
         }
     }
 
