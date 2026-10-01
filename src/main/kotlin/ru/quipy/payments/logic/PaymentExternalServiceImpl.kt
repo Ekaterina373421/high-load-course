@@ -54,9 +54,6 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // кейс 1. блокируем поток, пока не освободится слот
-        rateLimiter.tickBlocking()
-
         // кейс 2. блокируем поток, пока не освободится слот окна,
         window.acquire()
         val slotReleased = AtomicBoolean(false)
@@ -68,6 +65,9 @@ class PaymentExternalSystemAdapterImpl(
                 rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
                 return
             }
+
+            // кейс 1. блокируем поток, пока не освободится слот
+            rateLimiter.tickBlocking()
 
             logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -124,6 +124,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
     }
+
     private fun canBeProcessedBefore(deadlineAt: Long) = now() + expectedProcessingMillis <= deadlineAt
 
     private fun resolveDeadline(paymentStartedAt: Long, deadline: Long): Long =
