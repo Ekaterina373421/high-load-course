@@ -6,7 +6,7 @@ Content-Type: application/json
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
   "ratePerSecond": 2,
-  "testCount": 100,
+  "testCount": 500,
   "processingTimeMillis": 60000
 }
 

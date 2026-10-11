@@ -22,6 +22,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val paymentFlowMetrics: PaymentFlowMetrics,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -84,12 +85,22 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            val call = client.newCall(request)
+            paymentFlowMetrics.sent()
+            val response = try {
+                call.execute()
+            } catch (e: Exception) {
+                paymentFlowMetrics.completed()
+                throw e
+            }
+            response.use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                } finally {
+                    paymentFlowMetrics.completed()
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -133,6 +144,7 @@ class PaymentExternalSystemAdapterImpl(
     // Оплату, которая не успеет до дедлайна, обрабатываем локально: провайдера не беспокоим, но исход фиксируем
     // в event store, чтобы сервис тестирования увидел завершённый жизненный цикл оплаты
     private fun rejectBeforeSubmission(paymentId: UUID, paymentStartedAt: Long, deadline: Long, deadlineAt: Long) {
+        paymentFlowMetrics.rejectedDeadline()
         val transactionId = UUID.randomUUID()
         logger.warn(
             "[$accountName] Payment $paymentId rejected locally: deadline exceeded " +
