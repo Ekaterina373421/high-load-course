@@ -628,6 +628,70 @@
           ],
           "title": "Income / Expenses amount",
           "type": "stat"
+                },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineInterpolation": "smooth",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "showPoints": "never"
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 281
+          },
+          "id": 101,
+          "options": {
+            "legend": {
+              "calcs": ["max"],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "11.4.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "sum(rate(payment_flow_total[1m])) by (stage)",
+              "hide": false,
+              "instant": false,
+              "legendFormat": "{{stage}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Payment Flow Stages (rps)",
+          "type": "timeseries"
         }
       ],
       "title": "General",

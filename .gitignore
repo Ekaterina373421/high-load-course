@@ -38,3 +38,6 @@ build/
 grafana-data/
 prometheus-data/
 postgres-data/
+grafana/
+prometheus/
+postgres/

@@ -37,7 +37,8 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val expectedProcessingMillis = requestAverageProcessingTime.toMillis()
+    // Добавляем 600ms запаса на сетевые задержки к среднему времени провайдера
+    private val expectedProcessingMillis = requestAverageProcessingTime.toMillis() + 600L
 
     // кейс 1. создаем rate limiter с лимитом из настроек аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -55,8 +56,15 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // кейс 2. блокируем поток, пока не освободится слот окна,
-        window.acquire()
+        // кейс 2 & 3. ждём слот окна не более 2,5 секунд, чтобы не забивать пул 16 потоков
+        val timeBudgetMs = deadlineAt - now() - expectedProcessingMillis
+        val acquireTimeoutMs = minOf(timeBudgetMs, 2500L)
+
+        if (acquireTimeoutMs <= 0 || !window.acquire(Duration.ofMillis(acquireTimeoutMs))) {
+            rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
+            return
+        }
+
         val slotReleased = AtomicBoolean(false)
 
         val transactionId = UUID.randomUUID()
@@ -69,6 +77,12 @@ class PaymentExternalSystemAdapterImpl(
 
             // кейс 1. блокируем поток, пока не освободится слот
             rateLimiter.tickBlocking()
+
+            // кейс 3. после ожидания лимитера проверяем, не истёк ли дедлайн
+            if (!canBeProcessedBefore(deadlineAt)) {
+                rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
+                return
+            }
 
             logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
