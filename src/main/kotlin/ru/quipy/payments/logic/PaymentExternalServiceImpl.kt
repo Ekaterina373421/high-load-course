@@ -127,8 +127,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun canBeProcessedBefore(deadlineAt: Long) = now() + expectedProcessingMillis <= deadlineAt
 
-    private fun resolveDeadline(paymentStartedAt: Long, deadline: Long): Long =
-        if (deadline > 0L) paymentStartedAt + deadline else Long.MAX_VALUE   // дедлайн не задан
+    private fun resolveDeadline(paymentStartedAt: Long, deadline: Long): Long {
+        if (deadline <= 0L) return Long.MAX_VALUE
+        return if (deadline > paymentStartedAt) deadline else paymentStartedAt + deadline
+    }
 
     // Оплату, которая не успеет до дедлайна, обрабатываем локально: провайдера не беспокоим, но исход фиксируем
     // в event store, чтобы сервис тестирования увидел завершённый жизненный цикл оплаты
