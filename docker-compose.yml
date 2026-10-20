@@ -55,6 +55,8 @@ services:
     networks:
       - external_network
     environment:
+      - GF_DATABASE_WAL=true
+      - GF_DATABASE_TRANSACTION_RETRIES=30
       - TEST_SERVICE_IP=host.docker.internal
       - TOKENS_AUTH_HOSTS=77.234.215.138:34321,host.docker.internal:4321
     extra_hosts:

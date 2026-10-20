@@ -56,4 +56,6 @@ class OrderPayer {
         }
         return createdAt
     }
+
+    fun canAcceptPayment(): Boolean = paymentService.canAcceptPayment()
 }

@@ -37,12 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    // Добавляем 600ms запаса на сетевые задержки к среднему времени провайдера
-    private val expectedProcessingMillis = requestAverageProcessingTime.toMillis() + 600L
-    // Интервал высвобождения 1 слота (T / P)
-    private val slotReleaseIntervalMs = requestAverageProcessingTime.toMillis().toDouble() / maxOf(1, parallelRequests)
-    // Максимально допустимое время ожидания слота (2,5 интервала), чтобы не забить пул из 16 потоков
-    private val maxWindowWaitMs = (slotReleaseIntervalMs * 2.5).toLong()
+    private val expectedProcessingMillis = requestAverageProcessingTime.toMillis()
 
     // кейс 1. создаем rate limiter с лимитом из настроек аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -55,15 +50,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val deadlineAt = resolveDeadline(paymentStartedAt, deadline)
 
-        if (!canBeProcessedBefore(deadlineAt)) {
-            rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
-            return
-        }
-
-        // кейс 2 & 3. ждём слот окна не дольше дедлайна
-        // Берем минимум между дедлайном клиента и допустимым пределом задержки пула
-        val timeBudgetMs = (deadlineAt - now() - expectedProcessingMillis).coerceAtLeast(0L)
-        val acquireTimeoutMs = minOf(timeBudgetMs, maxWindowWaitMs)
+        // кейс 2. Честный бюджет времени ожидания слота исходя из дедлайна клиента
+        val acquireTimeoutMs = (deadlineAt - now() - expectedProcessingMillis).coerceAtLeast(0L)
 
         if (acquireTimeoutMs <= 0 || !window.acquire(Duration.ofMillis(acquireTimeoutMs))) {
             rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
@@ -75,11 +63,6 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
 
         try {
-            if (!canBeProcessedBefore(deadlineAt)) {
-                rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
-                return
-            }
-
             // кейс 1. блокируем поток, пока не освободится слот
             rateLimiter.tickBlocking()
 
@@ -185,6 +168,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    override fun canAcceptPayment(): Boolean = window.awaitingQueueSize() == 0
 }
 
 public fun now() = System.currentTimeMillis()
