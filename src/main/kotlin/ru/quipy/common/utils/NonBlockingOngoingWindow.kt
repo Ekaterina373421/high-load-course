@@ -23,6 +23,11 @@ class OngoingWindow(
     fun release() = window.release()
 
     fun awaitingQueueSize() = window.queueLength
+
+    // кейс 4
+    fun availablePermits(): Int = window.availablePermits()
+
+    fun tryAcquire(): Boolean = window.tryAcquire()
 }
 
 class NonBlockingOngoingWindow(

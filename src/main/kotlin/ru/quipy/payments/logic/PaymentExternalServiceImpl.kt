@@ -13,7 +13,7 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -43,22 +43,26 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     // кейс 2. создаем окно in-flight запросов с лимитом из настроек аккаунта
-    private val window = OngoingWindow(parallelRequests)
+    private val maxInFlight = minOf(
+        parallelRequests,
+        maxOf(1, (rateLimitPerSec * requestAverageProcessingTime.toMillis() / 1000.0).toInt())
+    )
+    private val inFlightCount = AtomicInteger(0)
 
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val deadlineAt = resolveDeadline(paymentStartedAt, deadline)
 
-        // кейс 2. Честный бюджет времени ожидания слота исходя из дедлайна клиента
-        val acquireTimeoutMs = (deadlineAt - now() - expectedProcessingMillis).coerceAtLeast(0L)
+        // // кейс 2. Честный бюджет времени ожидания слота исходя из дедлайна клиента
+        // val acquireTimeoutMs = (deadlineAt - now() - expectedProcessingMillis).coerceAtLeast(0L)
 
-        if (acquireTimeoutMs <= 0 || !window.acquire(Duration.ofMillis(acquireTimeoutMs))) {
-            rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
-            return
-        }
+        // if (acquireTimeoutMs <= 0 || !window.acquire(Duration.ofMillis(acquireTimeoutMs))) {
+        //     rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
+        //     return
+        // }
 
-        val slotReleased = AtomicBoolean(false)
+        // val slotReleased = AtomicBoolean(false)
 
         val transactionId = UUID.randomUUID()
 
@@ -132,9 +136,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         } finally {
             // Слот окна освобождаем на всех путях (успех / отказ / исключение)
-            if (slotReleased.compareAndSet(false, true)) {
-                window.release()
-            }
+            inFlightCount.decrementAndGet()
         }
     }
 
@@ -168,7 +170,18 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    override fun canAcceptPayment(): Boolean = window.awaitingQueueSize() == 0
+    override fun canAcceptPayment(): Boolean {
+        if (!isEnabled()) return false
+        while (true) {
+            val current = inFlightCount.get()
+            if (current >= maxInFlight) {
+                return false
+            }
+            if (inFlightCount.compareAndSet(current, current + 1)) {
+                return true
+            }
+        }
+    }
 }
 
 public fun now() = System.currentTimeMillis()

@@ -60,9 +60,8 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
 
         if (!orderPayer.canAcceptPayment()) {
-            val retryAfterMs = System.currentTimeMillis() + 1000L
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", retryAfterMs.toString())
+                .header("Retry-After", "1")
                 .build()
         }
 
