@@ -10,6 +10,15 @@ interface PaymentService {
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     fun canAcceptPayment(): Boolean
+
+    fun tryAdmit(deadlineAt: Long): PaymentAdmission
+
+}
+
+sealed interface PaymentAdmission {
+    data object Accepted : PaymentAdmission
+
+    data class Rejected(val retryAtMillis: Long) : PaymentAdmission
 }
 
 /**
@@ -26,7 +35,11 @@ interface PaymentExternalSystemAdapter {
     fun price(): Int
 
     fun isEnabled(): Boolean
-    
+
+    fun accountProperties(): PaymentAccountProperties
+
+    fun processingReserveMillis(): Long
+
     fun canAcceptPayment(): Boolean
 }
 

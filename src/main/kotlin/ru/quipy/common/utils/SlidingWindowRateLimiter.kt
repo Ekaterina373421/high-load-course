@@ -1,35 +1,39 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
-import java.util.concurrent.atomic.AtomicLong
+import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
+import kotlin.math.ceil
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
     private val window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+    companion object {
+        const val WINDOW_MILLIS = 1010.0
 
-    private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(10_000)
+        fun intervalNanos(ratePerSecond: Double): Long {
+            require(ratePerSecond > 0 && ratePerSecond.isFinite())
+            return ceil(WINDOW_MILLIS * 1_000_000 / ratePerSecond).toLong()
+        }
+    }
+
+    init {
+        require(rate > 0)
+        require(!window.isNegative && !window.isZero)
+    }
+
+    private val windowNanos = window.toNanos()
+    private val lock = ReentrantLock(true)
+    private val dispatches = ArrayDeque<Long>()
 
     override fun tick(): Boolean {
-        while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
-            }
+        if (!lock.tryLock(0, TimeUnit.NANOSECONDS)) return false
+        try {
+            return tryAcquire(System.nanoTime())
+        } finally {
+            lock.unlock()
         }
     }
 
@@ -39,32 +43,31 @@ class SlidingWindowRateLimiter(
         }
     }
 
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
+    fun awaitPermission(deadlineAt: Long): Boolean {
+        val remainingMillis = deadlineAt - System.currentTimeMillis()
+        if (remainingMillis <= 0 || !lock.tryLock(remainingMillis, TimeUnit.MILLISECONDS)) return false
+        try {
+            while (true) {
+                val remaining = deadlineAt - System.currentTimeMillis()
+                if (remaining <= 0) return false
+                val now = System.nanoTime()
+                if (tryAcquire(now)) return true
+                val waitNanos = windowNanos - (now - dispatches.peekFirst())
+                TimeUnit.NANOSECONDS.sleep(
+                    minOf(waitNanos, TimeUnit.MILLISECONDS.toNanos(remaining))
+                )
+            }
+        } finally {
+            lock.unlock()
         }
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
-            }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
+    private fun tryAcquire(now: Long): Boolean {
+        while (dispatches.isNotEmpty() && now - dispatches.peekFirst() >= windowNanos) {
+            dispatches.removeFirst()
         }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
+        if (dispatches.size.toLong() >= rate) return false
+        dispatches.addLast(now)
+        return true
     }
 }

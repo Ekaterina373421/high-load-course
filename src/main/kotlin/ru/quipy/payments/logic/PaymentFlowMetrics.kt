@@ -10,6 +10,7 @@ class PaymentFlowMetrics(registry: MeterRegistry) {
     private val sent = counter(registry, "sent")
     private val completed = counter(registry, "completed")
     private val rejectedDeadline = counter(registry, "rejected_deadline")
+    private val rejectedAdmission = counter(registry, "rejected_admission")
 
     fun received() = received.increment()
 
@@ -18,6 +19,8 @@ class PaymentFlowMetrics(registry: MeterRegistry) {
     fun completed() = completed.increment()
 
     fun rejectedDeadline() = rejectedDeadline.increment()
+
+    fun rejectedAdmission() = rejectedAdmission.increment()
 
     private fun counter(registry: MeterRegistry, stage: String): Counter =
         Counter.builder("payment.flow")

@@ -4,9 +4,11 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.apigateway.APIController
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
+import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
@@ -29,6 +31,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentFlowMetrics: PaymentFlowMetrics
 
+    @Autowired
+    private lateinit var orderRepository: OrderRepository
+
     private val paymentExecutor = ThreadPoolExecutor(
         200,
         200,
@@ -39,20 +44,25 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    /**
+     * Резервируем место во входном оконном meter до любых DB-операций.
+     * Всплеск допускается целиком, если его можно отправить до дедлайна.
+     */
+    fun tryAdmit(deadline: Long): PaymentAdmission = paymentService.tryAdmit(deadline)
+
+    fun processPayment(orderId: UUID, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
         paymentFlowMetrics.received()
         paymentExecutor.submit {
+            val order = orderRepository.findById(orderId)
+                ?: throw IllegalArgumentException("No such order $orderId")
+            orderRepository.save(order.copy(status = APIController.OrderStatus.PAYMENT_IN_PROGRESS))
+
             val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+                it.create(paymentId, orderId, order.price)
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            paymentService.submitPaymentRequest(paymentId, order.price, createdAt, deadline)
         }
         return createdAt
     }

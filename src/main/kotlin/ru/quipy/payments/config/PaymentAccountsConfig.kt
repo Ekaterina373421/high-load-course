@@ -14,6 +14,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import kotlin.math.ceil
 
 
 @Configuration
@@ -38,8 +39,15 @@ class PaymentAccountsConfig {
     @Bean
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
-        paymentFlowMetrics: PaymentFlowMetrics
+        paymentFlowMetrics: PaymentFlowMetrics,
+        @Value("\${payment.deadline.processing-time-multiplier:2.0}")
+        processingTimeMultiplier: Double,
+        @Value("\${payment.deadline.completion-reserve-millis:300}")
+        completionReserveMillis: Long,
     ): List<PaymentExternalSystemAdapter> {
+        require(processingTimeMultiplier.isFinite() && processingTimeMultiplier >= 1.0)
+        require(completionReserveMillis >= 0)
+
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -61,7 +69,10 @@ class PaymentAccountsConfig {
                     paymentService,
                     paymentProviderHostPort,
                     token,
-                    paymentFlowMetrics
+                    paymentFlowMetrics,
+                    processingReserveMillis = ceil(
+                        it.averageProcessingTime.toMillis().coerceAtLeast(0) * processingTimeMultiplier
+                    ).toLong() + completionReserveMillis,
                 )
             }
     }

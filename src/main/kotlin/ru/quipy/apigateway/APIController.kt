@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.PaymentAdmission
 import java.util.*
 
 @RestController
@@ -58,20 +59,15 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
-
-        if (!orderPayer.canAcceptPayment()) {
+        val admission = orderPayer.tryAdmit(deadline)
+        if (admission is PaymentAdmission.Rejected) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
+                .header("Retry-After", admission.retryAtMillis.toString())
                 .build()
         }
 
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
-
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val createdAt = orderPayer.processPayment(orderId, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
