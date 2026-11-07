@@ -12,6 +12,7 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -29,6 +30,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        private const val MAX_TEMPORARY_ERROR_ATTEMPTS = 2
     }
 
     private val serviceName = properties.serviceName
@@ -59,75 +62,157 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            // ожидание слота ограничено исходным дедлайном клиента.
-            // Rate permission берем позднее, непосредственно перед HTTP-вызовом.
-            val slotTimeoutMillis = deadlineAt - now() - processingReserveMillis
-            if (slotTimeoutMillis <= 0 || !inFlightSemaphore.tryAcquire(slotTimeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                rejectBeforeSubmission(paymentId, paymentStartedAt, deadline, deadlineAt)
-                return
-            }
-
-            try {
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
             // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            // Фиксируем регистрацию отправки в Event Store ровно один раз (до retry-цикла).
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+            val pureHttpTimeMs = requestAverageProcessingTime.toMillis().coerceAtLeast(0)
 
-            val call = client.newCall(request)
-            val limiterStartedAt = System.nanoTime()
-            val permitted = rateLimiter.awaitPermission(deadlineAt - processingReserveMillis)
-            val limiterWaitNanos = System.nanoTime() - limiterStartedAt
-            val dispatchWaitMillis = (now() - paymentStartedAt).coerceAtLeast(0)
-            if (!permitted) {
-                paymentFlowMetrics.rejectedDeadline()
-                logger.warn(
-                    "[$accountName] Dispatch permission rejected: payment=$paymentId, txId=$transactionId, " +
-                        "dispatchWaitMillis=$dispatchWaitMillis, " +
-                        "limiterWaitMillis=${java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(limiterWaitNanos)}, " +
-                        "remainingMillis=${deadlineAt - now()}, processingReserveMillis=$processingReserveMillis"
-                )
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded waiting for dispatch.")
-                }
-                return
-            }
-            logger.info("[$accountName] Dispatch: payment=$paymentId, txId=$transactionId, dispatchWaitMillis=$dispatchWaitMillis, limiterWaitMillis=${java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(limiterWaitNanos)}, remainingMillis=${deadlineAt - now()}")
-            paymentFlowMetrics.sent()
-            val httpStartedAt = System.nanoTime()
-            val body = try {
-                    call.execute().use { response ->
-                        val responseBody = response.body?.string()
+            var attempts = 0
+            var finalBody: ExternalSysResponse? = null
+
+            while (attempts < MAX_TEMPORARY_ERROR_ATTEMPTS) {
+                // Если это повторная попытка (retry) — спящий поток НЕ удерживает слот в семафоре.
+                if (attempts > 0) {
+                    val retryDelayMs = pureHttpTimeMs
+                    val requiredBudgetForRetry = retryDelayMs + pureHttpTimeMs
+
+                    if (deadlineAt - now() <= requiredBudgetForRetry) {
+                        break // Не успеваем сделать паузу и следующий HTTP-запрос
+                    }
+
+                    if (retryDelayMs > 0) {
                         try {
-                            mapper.readValue(responseBody, ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $responseBody", e)
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            Thread.sleep(retryDelayMs)
+                        } catch (e: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
                         }
                     }
+                }
+
+                // Защитный резерв (processingReserveMillis) применяется только для первичного входа (attempts == 0).
+                // Для retry используется чистая оценка времени одного HTTP-вызова (pureHttpTimeMs).
+                val requiredReserve = if (attempts == 0) processingReserveMillis else pureHttpTimeMs
+                val slotTimeoutMillis = deadlineAt - now() - requiredReserve
+                if (slotTimeoutMillis <= 0) break
+
+                val acquired = inFlightSemaphore.tryAcquire(slotTimeoutMillis, TimeUnit.MILLISECONDS)
+                if (!acquired) break
+
+                try {
+                    val limiterStartedAt = System.nanoTime()
+                    val permitted = rateLimiter.awaitPermission(deadlineAt - pureHttpTimeMs)
+                    val limiterWaitNanos = System.nanoTime() - limiterStartedAt
+                    val dispatchWaitMillis = (now() - paymentStartedAt).coerceAtLeast(0)
+
+                    if (!permitted) {
+                        logger.warn(
+                            "[$accountName] Dispatch permission rejected: payment=$paymentId, txId=$transactionId, " +
+                                "dispatchWaitMillis=$dispatchWaitMillis, " +
+                                "limiterWaitMillis=${TimeUnit.NANOSECONDS.toMillis(limiterWaitNanos)}, " +
+                                "remainingMillis=${deadlineAt - now()}, processingReserveMillis=$processingReserveMillis, " +
+                                "attempt=$attempts"
+                        )
+                        break
+                    }
+
+                    attempts++
+                    logger.info(
+                        "[$accountName] Dispatch: payment=$paymentId, txId=$transactionId, " +
+                            "dispatchWaitMillis=$dispatchWaitMillis, " +
+                            "limiterWaitMillis=${TimeUnit.NANOSECONDS.toMillis(limiterWaitNanos)}, " +
+                            "remainingMillis=${deadlineAt - now()}, attempt=$attempts"
+                    )
+                    paymentFlowMetrics.sent()
+
+                    val request = Request.Builder().run {
+                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                        post(emptyBody)
+                    }.build()
+
+                    val httpTimeoutMillis = (deadlineAt - now()).coerceAtLeast(1)
+                    val call = client.newCall(request)
+                    call.timeout().timeout(httpTimeoutMillis, TimeUnit.MILLISECONDS)
+
+                    val httpStartedAt = System.nanoTime()
+                    val body = try {
+                        call.execute().use { response ->
+                            val responseBody = response.body?.string()
+                            try {
+                                mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                logger.error(
+                                    "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
+                                        "payment: $paymentId, result code: ${response.code}, reason: $responseBody",
+                                    e,
+                                )
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        logger.error(
+                            "[$accountName] [ERROR] Payment HTTP call failed for txId: $transactionId, " +
+                                "payment: $paymentId, attempt=$attempts",
+                            e,
+                        )
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    } finally {
+                        val httpDurationNanos = System.nanoTime() - httpStartedAt
+                        paymentFlowMetrics.completed()
+                        logger.info(
+                            "[$accountName] HTTP completed: payment=$paymentId, txId=$transactionId, " +
+                                "httpDurationMillis=${TimeUnit.NANOSECONDS.toMillis(httpDurationNanos)}, " +
+                                "remainingMillis=${deadlineAt - now()}"
+                        )
+                    }
+
+                    finalBody = body
+                    logger.warn(
+                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                            "succeeded: ${body.result}, message: ${body.message}, attempt=$attempts"
+                    )
+
+                    val isTemporaryError =
+                        !body.result && body.message?.trim()?.equals("Temporary error", ignoreCase = true) == true
+                    if (body.result || !isTemporaryError) {
+                        break // Успех или неповторяемая ошибка — выходим из цикла
+                    }
                 } finally {
-                    val httpDurationNanos = System.nanoTime() - httpStartedAt
-                    paymentFlowMetrics.completed()
-                    logger.info("[$accountName] HTTP completed: payment=$paymentId, txId=$transactionId, httpDurationMillis=${java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(httpDurationNanos)}, remainingMillis=${deadlineAt - now()}")
+                    // Слот in-flight освобождаем на всех путях (успех / отказ / исключение)
+                    inFlightSemaphore.release()
                 }
+            }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
+            // Финальная фиксация результата в Event Store без искажения доменной модели
+            val result = finalBody
+            if (result != null) {
+                // HTTP-запрос вызвался хотя бы раз: пишем реальный результат провайдера (true или false)
                 paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    it.logProcessing(
+                        result.result,
+                        now(),
+                        transactionId,
+                        reason = result.message ?: if (result.result) "SUCCESS" else "Failed after $attempts attempt(s)",
+                    )
                 }
-            } finally {
-                // Слот in-flight освобождаем на всех путях (успех / отказ / исключение)
-                inFlightSemaphore.release()
+            } else {
+                // До HTTP вызова дело не дошло (превышен бюджет времени/семафора/rate limiter)
+                paymentFlowMetrics.rejectedDeadline()
+                logger.warn(
+                    "[$accountName] Payment $paymentId rejected locally: deadline exceeded " +
+                        "(deadline=$deadline, deadlineAt=$deadlineAt, now=${now()}, " +
+                        "dispatchWaitMillis=${(now() - paymentStartedAt).coerceAtLeast(0)}, " +
+                        "remainingMillis=${deadlineAt - now()}, processingReserveMillis=$processingReserveMillis)"
+                )
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded before HTTP execution.")
+                }
             }
         } catch (e: Exception) {
             when (e) {

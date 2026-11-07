@@ -4,6 +4,7 @@ import java.time.Duration
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.ceil
 
 class SlidingWindowRateLimiter(
@@ -29,7 +30,7 @@ class SlidingWindowRateLimiter(
     private val dispatches = ArrayDeque<Long>()
 
     override fun tick(): Boolean {
-        if (!lock.tryLock(0, TimeUnit.NANOSECONDS)) return false
+        if (!lock.tryLock()) return false
         try {
             return tryAcquire(System.nanoTime())
         } finally {
@@ -44,21 +45,31 @@ class SlidingWindowRateLimiter(
     }
 
     fun awaitPermission(deadlineAt: Long): Boolean {
-        val remainingMillis = deadlineAt - System.currentTimeMillis()
-        if (remainingMillis <= 0 || !lock.tryLock(remainingMillis, TimeUnit.MILLISECONDS)) return false
-        try {
-            while (true) {
-                val remaining = deadlineAt - System.currentTimeMillis()
-                if (remaining <= 0) return false
+        while (true) {
+            val nowMillis = System.currentTimeMillis()
+            val remainingMillis = deadlineAt - nowMillis
+            if (remainingMillis <= 0) return false
+
+            // Блокировка захватывается ТОЛЬКО для быстрых операций с очереди
+            val waitNanos = lock.withLock {
                 val now = System.nanoTime()
-                if (tryAcquire(now)) return true
-                val waitNanos = windowNanos - (now - dispatches.peekFirst())
-                TimeUnit.NANOSECONDS.sleep(
-                    minOf(waitNanos, TimeUnit.MILLISECONDS.toNanos(remaining))
-                )
+                if (tryAcquire(now)) {
+                    return true
+                }
+                val oldest = dispatches.peekFirst() ?: now
+                windowNanos - (now - oldest)
             }
-        } finally {
-            lock.unlock()
+
+            val waitMillis = TimeUnit.NANOSECONDS.toMillis(waitNanos) + 1
+            if (waitMillis > remainingMillis) return false
+
+            // Сон происходит БЕЗ УДЕРЖАНИЯ ЛОКА
+            try {
+                Thread.sleep(minOf(waitMillis, remainingMillis))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
         }
     }
 
