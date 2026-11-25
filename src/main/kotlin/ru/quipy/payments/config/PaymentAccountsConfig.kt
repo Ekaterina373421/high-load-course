@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.core.env.Environment
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
@@ -41,6 +42,7 @@ class PaymentAccountsConfig {
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         paymentFlowMetrics: PaymentFlowMetrics,
         paymentAttemptMetrics: PaymentAttemptMetrics,
+        environment: Environment,
         @Value("\${payment.deadline.processing-time-multiplier:2.0}")
         processingTimeMultiplier: Double,
         @Value("\${payment.deadline.completion-reserve-millis:300}")
@@ -75,6 +77,11 @@ class PaymentAccountsConfig {
                     processingReserveMillis = ceil(
                         it.averageProcessingTime.toMillis().coerceAtLeast(0) * processingTimeMultiplier
                     ).toLong() + completionReserveMillis,
+                    attemptTimeoutMillis = environment.getProperty("payment.attempt.${it.accountName}.timeout-millis", Long::class.java, 0L),
+                    maxAttempts = environment.getProperty("payment.attempt.${it.accountName}.max-attempts", Int::class.java, 2),
+                    retryDelayMillis = environment.getProperty("payment.attempt.${it.accountName}.retry-delay-millis", Long::class.java, it.averageProcessingTime.toMillis().coerceAtLeast(0)),
+                    retryTimeouts = environment.getProperty("payment.attempt.${it.accountName}.retry-timeouts", Boolean::class.java, false),
+                    resultReserveMillis = environment.getProperty("payment.attempt.${it.accountName}.result-reserve-millis", Long::class.java, 100L),
                 )
             }
     }
