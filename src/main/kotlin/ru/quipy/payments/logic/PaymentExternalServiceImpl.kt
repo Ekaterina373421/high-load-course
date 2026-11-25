@@ -10,6 +10,8 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
+import java.io.IOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -22,6 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val paymentFlowMetrics: PaymentFlowMetrics,
+    private val paymentAttemptMetrics: PaymentAttemptMetrics,
     private val processingReserveMillis: Long,
 ) : PaymentExternalSystemAdapter {
 
@@ -50,6 +53,10 @@ class PaymentExternalSystemAdapterImpl(
     private val inFlightSemaphore = java.util.concurrent.Semaphore(parallelRequests, true)
 
     private val client = OkHttpClient.Builder().build()
+
+    init {
+        paymentAttemptMetrics.registerAccount(accountName)
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val deadlineAt = deadline
@@ -141,12 +148,17 @@ class PaymentExternalSystemAdapterImpl(
                     call.timeout().timeout(httpTimeoutMillis, TimeUnit.MILLISECONDS)
 
                     val httpStartedAt = System.nanoTime()
+                    var httpOutcome = "error"
+                    if (attempts > 1) paymentAttemptMetrics.retryStarted(accountName)
                     val body = try {
                         call.execute().use { response ->
                             val responseBody = response.body?.string()
                             try {
-                                mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                                mapper.readValue(responseBody, ExternalSysResponse::class.java).also {
+                                    httpOutcome = if (response.isSuccessful && it.result) "success" else "provider_failure"
+                                }
                             } catch (e: Exception) {
+                                httpOutcome = "invalid_response"
                                 logger.error(
                                     "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
                                         "payment: $paymentId, result code: ${response.code}, reason: $responseBody",
@@ -156,6 +168,12 @@ class PaymentExternalSystemAdapterImpl(
                             }
                         }
                     } catch (e: Exception) {
+                        httpOutcome = when {
+                            e is SocketTimeoutException -> "timeout"
+                            e is InterruptedIOException && e.message?.contains("timeout", ignoreCase = true) == true -> "timeout"
+                            e is IOException -> "io_error"
+                            else -> "error"
+                        }
                         logger.error(
                             "[$accountName] [ERROR] Payment HTTP call failed for txId: $transactionId, " +
                                 "payment: $paymentId, attempt=$attempts",
@@ -164,6 +182,7 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     } finally {
                         val httpDurationNanos = System.nanoTime() - httpStartedAt
+                        paymentAttemptMetrics.recordHttp(accountName, httpOutcome, httpDurationNanos)
                         paymentFlowMetrics.completed()
                         logger.info(
                             "[$accountName] HTTP completed: payment=$paymentId, txId=$transactionId, " +

@@ -40,6 +40,7 @@ class PaymentAccountsConfig {
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         paymentFlowMetrics: PaymentFlowMetrics,
+        paymentAttemptMetrics: PaymentAttemptMetrics,
         @Value("\${payment.deadline.processing-time-multiplier:2.0}")
         processingTimeMultiplier: Double,
         @Value("\${payment.deadline.completion-reserve-millis:300}")
@@ -70,6 +71,7 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     paymentFlowMetrics,
+                    paymentAttemptMetrics,
                     processingReserveMillis = ceil(
                         it.averageProcessingTime.toMillis().coerceAtLeast(0) * processingTimeMultiplier
                     ).toLong() + completionReserveMillis,

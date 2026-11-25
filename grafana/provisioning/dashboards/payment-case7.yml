@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: Payment case 7
+    folder: bombardier
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards/PaymentCase7.json
