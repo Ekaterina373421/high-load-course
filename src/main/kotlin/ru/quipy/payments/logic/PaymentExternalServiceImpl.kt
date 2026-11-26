@@ -10,6 +10,8 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.net.SocketTimeoutException
+import java.io.InterruptedIOException
+import java.io.IOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -22,7 +24,11 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val paymentFlowMetrics: PaymentFlowMetrics,
+    private val paymentAttemptMetrics: PaymentAttemptMetrics,
     private val processingReserveMillis: Long,
+    private val attemptTimeoutMillis: Long = 0L,
+    private val maxAttempts: Int = 2,
+    private val retryTimeouts: Boolean = false,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -31,7 +37,6 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        private const val MAX_TEMPORARY_ERROR_ATTEMPTS = 2
     }
 
     private val serviceName = properties.serviceName
@@ -50,6 +55,13 @@ class PaymentExternalSystemAdapterImpl(
     private val inFlightSemaphore = java.util.concurrent.Semaphore(parallelRequests, true)
 
     private val client = OkHttpClient.Builder().build()
+
+    init {
+        require(attemptTimeoutMillis >= 0)
+        require(maxAttempts > 0)
+        paymentAttemptMetrics.registerAccount(accountName)
+        logger.info("[$accountName] Attempt policy: timeoutMillis=$attemptTimeoutMillis, maxAttempts=$maxAttempts, retryTimeouts=$retryTimeouts")
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val deadlineAt = deadline
@@ -76,29 +88,13 @@ class PaymentExternalSystemAdapterImpl(
             var attempts = 0
             var finalBody: ExternalSysResponse? = null
 
-            while (attempts < MAX_TEMPORARY_ERROR_ATTEMPTS) {
-                // Если это повторная попытка (retry) — спящий поток НЕ удерживает слот в семафоре.
-                if (attempts > 0) {
-                    val retryDelayMs = pureHttpTimeMs
-                    val requiredBudgetForRetry = retryDelayMs + pureHttpTimeMs
+            // новую попытку начинаем, только если осталось время на полный HTTP timeout.
+            val minimumAttemptBudget = if (attemptTimeoutMillis > 0)
+                attemptTimeoutMillis else pureHttpTimeMs
 
-                    if (deadlineAt - now() <= requiredBudgetForRetry) {
-                        break // Не успеваем сделать паузу и следующий HTTP-запрос
-                    }
-
-                    if (retryDelayMs > 0) {
-                        try {
-                            Thread.sleep(retryDelayMs)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        }
-                    }
-                }
-
-                // Защитный резерв (processingReserveMillis) применяется только для первичного входа (attempts == 0).
-                // Для retry используется чистая оценка времени одного HTTP-вызова (pureHttpTimeMs).
-                val requiredReserve = if (attempts == 0) processingReserveMillis else pureHttpTimeMs
+            while (attempts < maxAttempts) {
+                val requiredReserve = if (attemptTimeoutMillis > 0) minimumAttemptBudget
+                    else if (attempts == 0) processingReserveMillis else pureHttpTimeMs
                 val slotTimeoutMillis = deadlineAt - now() - requiredReserve
                 if (slotTimeoutMillis <= 0) break
 
@@ -107,7 +103,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 try {
                     val limiterStartedAt = System.nanoTime()
-                    val permitted = rateLimiter.awaitPermission(deadlineAt - pureHttpTimeMs)
+                    val permitted = rateLimiter.awaitPermission(deadlineAt - minimumAttemptBudget)
                     val limiterWaitNanos = System.nanoTime() - limiterStartedAt
                     val dispatchWaitMillis = (now() - paymentStartedAt).coerceAtLeast(0)
 
@@ -121,6 +117,11 @@ class PaymentExternalSystemAdapterImpl(
                         )
                         break
                     }
+
+                    val remainingForHttp = deadlineAt - now()
+                    if (remainingForHttp <= 0 || (attemptTimeoutMillis > 0 && remainingForHttp < attemptTimeoutMillis)) break
+                    val httpTimeoutMillis = if (attemptTimeoutMillis > 0)
+                        minOf(attemptTimeoutMillis, remainingForHttp) else remainingForHttp
 
                     attempts++
                     logger.info(
@@ -136,17 +137,21 @@ class PaymentExternalSystemAdapterImpl(
                         post(emptyBody)
                     }.build()
 
-                    val httpTimeoutMillis = (deadlineAt - now()).coerceAtLeast(1)
                     val call = client.newCall(request)
                     call.timeout().timeout(httpTimeoutMillis, TimeUnit.MILLISECONDS)
 
                     val httpStartedAt = System.nanoTime()
+                    var httpOutcome = "error"
+                    if (attempts > 1) paymentAttemptMetrics.retryStarted(accountName)
                     val body = try {
                         call.execute().use { response ->
                             val responseBody = response.body?.string()
                             try {
-                                mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                                mapper.readValue(responseBody, ExternalSysResponse::class.java).also {
+                                    httpOutcome = if (response.isSuccessful && it.result) "success" else "provider_failure"
+                                }
                             } catch (e: Exception) {
+                                httpOutcome = "invalid_response"
                                 logger.error(
                                     "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
                                         "payment: $paymentId, result code: ${response.code}, reason: $responseBody",
@@ -156,6 +161,12 @@ class PaymentExternalSystemAdapterImpl(
                             }
                         }
                     } catch (e: Exception) {
+                        httpOutcome = when {
+                            e is SocketTimeoutException -> "timeout"
+                            e is InterruptedIOException && e.message?.contains("timeout", ignoreCase = true) == true -> "timeout"
+                            e is IOException -> "io_error"
+                            else -> "error"
+                        }
                         logger.error(
                             "[$accountName] [ERROR] Payment HTTP call failed for txId: $transactionId, " +
                                 "payment: $paymentId, attempt=$attempts",
@@ -164,6 +175,7 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     } finally {
                         val httpDurationNanos = System.nanoTime() - httpStartedAt
+                        paymentAttemptMetrics.recordHttp(accountName, httpOutcome, httpDurationNanos)
                         paymentFlowMetrics.completed()
                         logger.info(
                             "[$accountName] HTTP completed: payment=$paymentId, txId=$transactionId, " +
@@ -180,8 +192,12 @@ class PaymentExternalSystemAdapterImpl(
 
                     val isTemporaryError =
                         !body.result && body.message?.trim()?.equals("Temporary error", ignoreCase = true) == true
-                    if (body.result || !isTemporaryError) {
+                    val retryableTimeout = retryTimeouts && httpOutcome == "timeout"
+                    if (body.result || !(isTemporaryError || retryableTimeout)) {
                         break // Успех или неповторяемая ошибка — выходим из цикла
+                    }
+                    if (attempts < maxAttempts) {
+                        logger.info("[$accountName] Retry candidate: payment=$paymentId, txId=$transactionId, attempt=$attempts, reason=$httpOutcome, remainingMillis=${deadlineAt - now()}")
                     }
                 } finally {
                     // Слот in-flight освобождаем на всех путях (успех / отказ / исключение)
