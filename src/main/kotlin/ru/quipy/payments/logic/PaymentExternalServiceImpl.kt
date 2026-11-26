@@ -28,9 +28,7 @@ class PaymentExternalSystemAdapterImpl(
     private val processingReserveMillis: Long,
     private val attemptTimeoutMillis: Long = 0L,
     private val maxAttempts: Int = 2,
-    private val retryDelayMillis: Long = properties.averageProcessingTime.toMillis().coerceAtLeast(0),
     private val retryTimeouts: Boolean = false,
-    private val resultReserveMillis: Long = 100L,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -61,9 +59,8 @@ class PaymentExternalSystemAdapterImpl(
     init {
         require(attemptTimeoutMillis >= 0)
         require(maxAttempts > 0)
-        require(retryDelayMillis >= 0 && resultReserveMillis >= 0)
         paymentAttemptMetrics.registerAccount(accountName)
-        logger.info("[$accountName] Attempt policy: timeoutMillis=$attemptTimeoutMillis, maxAttempts=$maxAttempts, retryDelayMillis=$retryDelayMillis, retryTimeouts=$retryTimeouts, resultReserveMillis=$resultReserveMillis")
+        logger.info("[$accountName] Attempt policy: timeoutMillis=$attemptTimeoutMillis, maxAttempts=$maxAttempts, retryTimeouts=$retryTimeouts")
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -91,32 +88,11 @@ class PaymentExternalSystemAdapterImpl(
             var attempts = 0
             var finalBody: ExternalSysResponse? = null
 
-            // Для ограниченных попыток оставляем время на полный HTTP и запись результата.
+            // новую попытку начинаем, только если осталось время на полный HTTP timeout.
             val minimumAttemptBudget = if (attemptTimeoutMillis > 0)
-                attemptTimeoutMillis + resultReserveMillis else pureHttpTimeMs
+                attemptTimeoutMillis else pureHttpTimeMs
 
             while (attempts < maxAttempts) {
-                // Если это повторная попытка (retry) — спящий поток НЕ удерживает слот в семафоре.
-                if (attempts > 0) {
-                    val retryDelayMs = retryDelayMillis
-                    val requiredBudgetForRetry = retryDelayMs + minimumAttemptBudget
-
-                    if (deadlineAt - now() <= requiredBudgetForRetry) {
-                        break // Не успеваем сделать паузу и следующий HTTP-запрос
-                    }
-
-                    if (retryDelayMs > 0) {
-                        try {
-                            Thread.sleep(retryDelayMs)
-                        } catch (e: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            break
-                        }
-                    }
-                }
-
-                // При настроенном timeout сохраняем время на полную попытку и запись результата.
-                // Без него сохраняется прежняя политика резервов для других аккаунтов.
                 val requiredReserve = if (attemptTimeoutMillis > 0) minimumAttemptBudget
                     else if (attempts == 0) processingReserveMillis else pureHttpTimeMs
                 val slotTimeoutMillis = deadlineAt - now() - requiredReserve
@@ -142,8 +118,7 @@ class PaymentExternalSystemAdapterImpl(
                         break
                     }
 
-                    val remainingForHttp = deadlineAt - now() -
-                        if (attemptTimeoutMillis > 0) resultReserveMillis else 0L
+                    val remainingForHttp = deadlineAt - now()
                     if (remainingForHttp <= 0 || (attemptTimeoutMillis > 0 && remainingForHttp < attemptTimeoutMillis)) break
                     val httpTimeoutMillis = if (attemptTimeoutMillis > 0)
                         minOf(attemptTimeoutMillis, remainingForHttp) else remainingForHttp
