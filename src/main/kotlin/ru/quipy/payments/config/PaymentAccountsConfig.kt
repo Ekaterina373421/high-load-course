@@ -79,9 +79,7 @@ class PaymentAccountsConfig {
                     ).toLong() + completionReserveMillis,
                     attemptTimeoutMillis = environment.getProperty("payment.attempt.${it.accountName}.timeout-millis", Long::class.java, 0L),
                     maxAttempts = environment.getProperty("payment.attempt.${it.accountName}.max-attempts", Int::class.java, 2),
-                    retryDelayMillis = environment.getProperty("payment.attempt.${it.accountName}.retry-delay-millis", Long::class.java, it.averageProcessingTime.toMillis().coerceAtLeast(0)),
                     retryTimeouts = environment.getProperty("payment.attempt.${it.accountName}.retry-timeouts", Boolean::class.java, false),
-                    resultReserveMillis = environment.getProperty("payment.attempt.${it.accountName}.result-reserve-millis", Long::class.java, 100L),
                 )
             }
     }
